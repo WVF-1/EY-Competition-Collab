@@ -1,93 +1,78 @@
-"""
-NWU Water Chemistry Data Pipeline
-===================================
-Processes all 5 NWU source files + Sample Stations into a single clean CSV
-that matches the EY competition training data schema exactly:
+# ============================================================
+# NWU WATER CHEMISTRY PIPELINE — GOOGLE COLAB VERSION
+# (FILES ALREADY UPLOADED)
+#
+# Fixes vs previous version:
+#   ✓ Outlier cap restored: 3× training maximum per variable
+#     (was accidentally dropped in the Colab rewrite)
+#   ✓ Zero-floor filter added: TA=0 and EC=0 are physically
+#     impossible — those rows are instrument errors or
+#     sentinel values that slipped through -9999 replacement
+#   ✓ Sanity check now reports counts removed at each stage
+#     and flags if any variable range looks implausible
+#
+# Cap values derived from EY training data maxima × 3:
+#   Total Alkalinity:              cap =  1,085 mg/L CaCO₃
+#   Electrical Conductance:        cap =  4,518 µS/cm
+#   Dissolved Reactive Phosphorus: cap =    585 µg/L
+#
+# These preserve genuine extreme South African waterbodies
+# (mineralised springs, seasonal pans) while removing
+# instrument errors, mine drainage spikes, and sewage
+# outflows that would corrupt the KD-tree spatial baselines.
+# ============================================================
 
-    Latitude | Longitude | Sample Date | Total Alkalinity |
-    Electrical Conductance | Dissolved Reactive Phosphorus
-
-Unit conversions applied:
-  - EC:  mS/m × 10     →  µS/cm       (matches training data range ~15–1,506)
-  - TAL: mg/L as CaCO₃ →  no change   (already matches training data)
-  - PO4: mg/L × 1,000  →  µg/L        (NWU stores as mg/L; training data is in µg/L.
-                                        Percentile alignment confirms this conversion:
-                                        NWU p50 × 1000 = 26  vs  training p50 = 20  ✓)
-
-Coordinates:
-  - Latitude stored as positive in NWU (South Africa convention) → negated to WGS84
-  - Longitude already positive (eastern hemisphere) → unchanged
-
-Files expected (place in BASE_DIR or update paths below):
-  - Dams_and_lakes_1999-2012__A-X_.xlsx
-  - Dams_and_lakes_up_to_1998__A-X_.xlsx
-  - Rivers_1999-2012__A-X_.xlsx
-  - Rivers_up_to_1998__A-D_.xlsx
-  - Rivers_up_to_1998__E-X_.xlsx
-  - Sample_stations.xlsx
-
-Usage:
-  python nwu_pipeline.py
-  Output: nwu_water_quality_clean.csv  (ready to concatenate with training data)
-
-Citation (required under CC BY 4.0):
-  Huizenga, J.M. et al. (2013). A national dataset of inorganic chemical data
-  of surface waters in South Africa. Water SA, 39(2).
-  waterscience.co.za/waterchemistry/data.html
-"""
-
-import os
-import re
 import pandas as pd
 import numpy as np
+import re
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE PATHS  —  update BASE_DIR to the folder containing your NWU downloads
-# ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR = "."
+MISSING_SENTINEL = -9999
 
+# Outlier caps: 3× the maximum observed in the EY training data.
+# Adjust these if your training data has a different range.
+TA_CAP  = 1085.0    # mg/L CaCO₃
+EC_CAP  = 4518.0    # µS/cm
+DRP_CAP = 585.0     # µg/L
+
+# Physical floor: values at or below zero are impossible
+# for surface water TA and EC (DRP can legitimately be ~0)
+TA_FLOOR  = 0.0
+EC_FLOOR  = 0.0
+
+# ------------------------------------------------------------
+# FILE NAMES (must match uploaded files)
+# ------------------------------------------------------------
 NWU_FILES = [
-    os.path.join(BASE_DIR, "Dams_and_lakes_1999-2012__A-X_.xlsx"),
-    os.path.join(BASE_DIR, "Dams_and_lakes_up_to_1998__A-X_.xlsx"),
-    os.path.join(BASE_DIR, "Rivers_1999-2012__A-X_.xlsx"),
-    os.path.join(BASE_DIR, "Rivers_up_to_1998__A-D_.xlsx"),
-    os.path.join(BASE_DIR, "Rivers_up_to_1998__E-X_.xlsx"),
+    'Rivers up to 1998 (A-D).xlsx',
+    'Dams and lakes 1999-2012 (A-X).xlsx',
+    'Rivers 1999-2012 (A-X).xlsx',
+    'Dams and lakes up to 1998 (A-X).xlsx',
+    'Rivers up to 1998 (E-X).xlsx',
 ]
 
-STATIONS_FILE = os.path.join(BASE_DIR, "Sample_stations.xlsx")
-OUTPUT_FILE   = os.path.join(BASE_DIR, "nwu_water_quality_clean.csv")
-
-MISSING_SENTINEL = -9999   # NWU's placeholder for missing data
+STATIONS_FILE = "Sample stations.xlsx"
+OUTPUT_FILE   = "nwu_water_quality_clean.csv"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Load & standardise one NWU measurement file
-# ─────────────────────────────────────────────────────────────────────────────
-def load_nwu_file(path: str) -> pd.DataFrame:
-    """
-    Reads one NWU Excel file.
-
-    Header layout:
-      Row 0 = section headers  (skipped)
-      Row 1 = unit labels      (skipped)
-      Row 2 = column names     <- used as header
-      Row 3+ = data
-
-    Extracts: STATION | DATE | EC (mS/m) | TAL (mg/L) | PO4 (mg/L)
-    Applies unit conversions and returns a clean DataFrame.
-    """
-    print(f"  Loading: {os.path.basename(path)}")
+# ------------------------------------------------------------
+# LOAD NWU MEASUREMENT FILE
+# ------------------------------------------------------------
+def load_nwu_file(path):
+    print(f"  Loading: {path}")
 
     df = pd.read_excel(path, header=2)
 
-    # Col 4 is EC in mS/m; pandas suffixes the duplicate EC col as 'EC.1'
-    # We rename explicitly so the logic is clear regardless of pandas version
+    # Col 4 is EC in mS/m — rename before anything else
     cols = df.columns.tolist()
-    col_rename = {cols[4]: "EC_mSm"}
-    df = df.rename(columns=col_rename)
+    df = df.rename(columns={cols[4]: "EC_mSm"})
 
-    # Different NWU files use different station column names — normalise all to STATION
-    station_aliases = ["STATION", "SAMPLE\nSTATION ID", "SAMPLE STATION ID", "SAMPLE_STATION_ID"]
+    # Station column has different names across files
+    station_aliases = [
+        "STATION",
+        "SAMPLE\nSTATION ID",
+        "SAMPLE STATION ID",
+        "SAMPLE_STATION_ID",
+    ]
     for alias in station_aliases:
         if alias in df.columns:
             df = df.rename(columns={alias: "STATION"})
@@ -96,49 +81,36 @@ def load_nwu_file(path: str) -> pd.DataFrame:
     needed = ["STATION", "DATE", "EC_mSm", "TAL", "PO4"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns {missing} in {os.path.basename(path)}")
+        raise ValueError(f"{path} — missing columns: {missing}")
 
     df = df[needed].copy()
 
-    # Replace missing sentinel with NaN
+    # Replace NWU missing sentinel with NaN
     df.replace(MISSING_SENTINEL, np.nan, inplace=True)
 
-    # ── Unit conversions ──────────────────────────────────────────────────
-    # EC: mS/m -> µS/cm  (x 10)
-    df["Electrical Conductance"] = df["EC_mSm"] * 10
-
-    # TAL: mg/L CaCO3 — no change needed
-    df["Total Alkalinity"] = df["TAL"]
-
-    # PO4: mg/L -> µg/L  (x 1000)
-    # NWU reports in mg/L; training data DRP is in µg/L.
-    # Percentile check confirms alignment after this conversion.
+    # ── Unit conversions ──────────────────────────────────────
+    # EC:  mS/m  × 10   → µS/cm
+    # TAL: mg/L CaCO₃   → no change
+    # PO4: mg/L  × 1000 → µg/L  (matches EY training units)
+    df["Electrical Conductance"]        = df["EC_mSm"] * 10
+    df["Total Alkalinity"]              = df["TAL"]
     df["Dissolved Reactive Phosphorus"] = df["PO4"] * 1000
 
-    # ── Parse dates (already datetime objects from Excel; coerce errors) ──
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 
-    # Drop intermediate columns
     df.drop(columns=["EC_mSm", "TAL", "PO4"], inplace=True)
 
     return df[["STATION", "DATE",
-               "Electrical Conductance",
                "Total Alkalinity",
+               "Electrical Conductance",
                "Dissolved Reactive Phosphorus"]]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Load & clean Sample Stations (coordinates)
-# ─────────────────────────────────────────────────────────────────────────────
-def load_stations(path: str) -> pd.DataFrame:
-    """
-    Returns: STATION | Latitude | Longitude
-
-    NWU stores latitudes as positive decimal degrees (South African convention).
-    WGS84 requires negative values for the southern hemisphere -> negate here.
-    Longitude is already positive (eastern hemisphere) -> unchanged.
-    """
-    print(f"  Loading stations: {os.path.basename(path)}")
+# ------------------------------------------------------------
+# LOAD STATION COORDINATES
+# ------------------------------------------------------------
+def load_stations(path):
+    print(f"  Loading stations: {path}")
 
     ss = pd.read_excel(path)
     ss = ss.rename(columns={
@@ -147,70 +119,80 @@ def load_stations(path: str) -> pd.DataFrame:
         "SOUTH LON.\nDECIMAL DEGR": "LON",
     })
 
-    ss = ss[["STATION", "LAT_POS", "LON"]].copy()
-
-    # Drop rows with missing or zero coordinates (data entry errors)
-    ss.dropna(subset=["LAT_POS", "LON"], inplace=True)
+    ss = ss[["STATION", "LAT_POS", "LON"]].dropna()
     ss = ss[(ss["LAT_POS"] != 0) & (ss["LON"] != 0)]
 
-    # Negate latitude for WGS84
+    # NWU stores latitude as positive — negate for WGS84
     ss["Latitude"]  = -ss["LAT_POS"].abs()
     ss["Longitude"] =  ss["LON"]
 
-    return ss[["STATION", "Latitude", "Longitude"]].drop_duplicates(subset="STATION")
+    return ss[["STATION", "Latitude", "Longitude"]].drop_duplicates()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
-def run_pipeline() -> pd.DataFrame:
-    print("\n" + "=" * 62)
-    print("  NWU WATER QUALITY PIPELINE")
-    print("=" * 62)
+# ------------------------------------------------------------
+# MAIN PIPELINE
+# ------------------------------------------------------------
+def run_pipeline():
+    print("\n" + "=" * 56)
+    print("  NWU WATER CHEMISTRY PIPELINE")
+    print("=" * 56)
 
-    # ── 3a. Load all available NWU measurement files ─────────────────────
+    # ── Load all measurement files ───────────────────────────
     frames = []
-    for fpath in NWU_FILES:
-        if not os.path.exists(fpath):
-            print(f"  ⚠️  Not found — skipping: {os.path.basename(fpath)}")
-            continue
+    for path in NWU_FILES:
         try:
-            frames.append(load_nwu_file(fpath))
+            frames.append(load_nwu_file(path))
         except Exception as exc:
-            print(f"  ✗ Error in {os.path.basename(fpath)}: {exc}")
+            print(f"  ⚠ Skipping {path}: {exc}")
 
     if not frames:
-        raise RuntimeError("No NWU files were loaded. Check BASE_DIR and file names.")
+        raise RuntimeError("No NWU files loaded — check filenames.")
 
     raw = pd.concat(frames, ignore_index=True)
-    print(f"\n  Combined raw rows:               {len(raw):>10,}")
+    print(f"\n  Raw rows combined:              {len(raw):>10,}")
 
-    # ── 3b. Load station coordinates ─────────────────────────────────────
+    # ── Join station coordinates ─────────────────────────────
     stations = load_stations(STATIONS_FILE)
-    print(f"  Station records with coords:    {len(stations):>10,}")
+    merged   = raw.merge(stations, on="STATION", how="inner")
+    print(f"  Rows after coordinate join:     {len(merged):>10,}")
 
-    # ── 3c. Join coordinates (inner join — only stations with known coords)
-    merged = raw.merge(stations, on="STATION", how="inner")
-    print(f"  Rows after coord join:          {len(merged):>10,}")
-
-    # ── 3d. Drop rows missing any target variable, coordinate, or date ───
+    # ── Drop rows with any missing target or coordinate ──────
     before = len(merged)
-    merged.dropna(
-        subset=["Electrical Conductance", "Total Alkalinity",
-                "Dissolved Reactive Phosphorus", "Latitude", "Longitude", "DATE"],
-        inplace=True,
-    )
+    merged.dropna(subset=[
+        "Total Alkalinity", "Electrical Conductance",
+        "Dissolved Reactive Phosphorus",
+        "Latitude", "Longitude", "DATE",
+    ], inplace=True)
     print(f"  Rows dropped (nulls):           {before - len(merged):>10,}")
 
-    # ── 3e. Deduplicate on STATION + DATE (same instrument, same day) ────
+    # ── Physical floor filter ────────────────────────────────
+    # TA = 0 and EC = 0 are physically impossible for surface
+    # water — these are instrument errors or missed sentinels.
+    before = len(merged)
+    merged = merged[
+        (merged["Total Alkalinity"]       > TA_FLOOR) &
+        (merged["Electrical Conductance"] > EC_FLOOR)
+    ]
+    print(f"  Rows dropped (zero floor):      {before - len(merged):>10,}")
+
+    # ── Outlier cap: 3× EY training maximum ─────────────────
+    # Removes mine drainage spikes, sewage outflows, and brine
+    # pans that would corrupt the KD-tree spatial baselines.
+    before = len(merged)
+    merged = merged[
+        (merged["Total Alkalinity"]              <= TA_CAP)  &
+        (merged["Electrical Conductance"]        <= EC_CAP)  &
+        (merged["Dissolved Reactive Phosphorus"] <= DRP_CAP)
+    ]
+    print(f"  Rows dropped (outlier cap 3×):  {before - len(merged):>10,}")
+
+    # ── Deduplicate: same station + same date ────────────────
     before = len(merged)
     merged.sort_values("DATE", inplace=True)
     merged.drop_duplicates(subset=["STATION", "DATE"], keep="first", inplace=True)
     print(f"  Rows dropped (station+date dup):{before - len(merged):>10,}")
 
-    # ── 3f. Average rows sharing the same Lat + Lon + Date ───────────────
-    # Handles two distinct stations registered at identical coordinates
-    # on the same calendar day — average measurements rather than drop.
+    # ── Average rows at identical coordinates on same date ───
     before = len(merged)
     merged = (
         merged
@@ -221,44 +203,37 @@ def run_pipeline() -> pd.DataFrame:
             "Dissolved Reactive Phosphorus": "mean",
         })
     )
-    averaged = before - len(merged)
-    if averaged > 0:
-        print(f"  Rows merged (coord+date dup):   {averaged:>10,}")
-    print(f"  Final clean rows:               {len(merged):>10,}")
+    if before - len(merged) > 0:
+        print(f"  Rows merged (coord+date dup):   {before - len(merged):>10,}")
 
-    # ── 3g. Format date to match training data: DD-MM-YYYY ───────────────
+    print(f"\n  Final clean rows:               {len(merged):>10,}")
+
+    # ── Format date to DD-MM-YYYY ────────────────────────────
     merged["Sample Date"] = merged["DATE"].dt.strftime("%d-%m-%Y")
 
-    # ── 3h. Select and order final columns to match training schema ───────
-    final_cols = [
-        "Latitude",
-        "Longitude",
-        "Sample Date",
-        "Total Alkalinity",
-        "Electrical Conductance",
+    output = merged[[
+        "Latitude", "Longitude", "Sample Date",
+        "Total Alkalinity", "Electrical Conductance",
         "Dissolved Reactive Phosphorus",
-    ]
-    output = merged[final_cols].reset_index(drop=True)
+    ]].reset_index(drop=True)
 
-    # ── 3i. Save ──────────────────────────────────────────────────────────
     output.to_csv(OUTPUT_FILE, index=False)
-    print(f"\n  ✅ Saved: {OUTPUT_FILE}")
+    print(f"  Saved: {OUTPUT_FILE}")
 
     return output
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Sanity checks
-# ─────────────────────────────────────────────────────────────────────────────
-def sanity_check(df: pd.DataFrame):
-    print("\n" + "=" * 62)
+# ------------------------------------------------------------
+# SANITY CHECKS
+# ------------------------------------------------------------
+def sanity_check(df):
+    print("\n" + "=" * 56)
     print("  SANITY CHECKS")
-    print("=" * 62)
+    print("=" * 56)
 
-    passed = 0
-    failed = 0
+    passed = failed = 0
 
-    def check(label: str, condition: bool, detail: str = ""):
+    def check(label, condition, detail=""):
         nonlocal passed, failed
         if condition:
             passed += 1
@@ -267,129 +242,75 @@ def sanity_check(df: pd.DataFrame):
             failed += 1
             print(f"  ❌ FAIL  {label}")
         if detail:
-            print(f"           -> {detail}")
+            print(f"           → {detail}")
 
-    # ── Schema ────────────────────────────────────────────────────────────
-    expected_cols = [
-        "Latitude", "Longitude", "Sample Date",
-        "Total Alkalinity", "Electrical Conductance",
-        "Dissolved Reactive Phosphorus",
-    ]
-    check(
-        "All 6 required columns present",
-        all(c in df.columns for c in expected_cols),
-        f"Found: {df.columns.tolist()}",
-    )
+    check("Row count > 0",
+          len(df) > 0, f"{len(df):,} rows")
 
-    check(
-        "Dataset is non-empty",
-        len(df) > 0,
-        f"Total rows: {len(df):,}",
-    )
+    check("Zero null values",
+          df.isnull().sum().sum() == 0,
+          str(df.isnull().sum().to_dict()))
 
-    # ── Nulls ─────────────────────────────────────────────────────────────
-    null_counts = df.isnull().sum()
-    check(
-        "No null values in any column",
-        null_counts.sum() == 0,
-        f"Null counts: {null_counts.to_dict()}",
-    )
+    check("Latitude within SA  (-35 to -22)",
+          df["Latitude"].between(-35, -22).all(),
+          f"{df['Latitude'].min():.4f} to {df['Latitude'].max():.4f}")
 
-    # ── Coordinates — South Africa bounding box ───────────────────────────
-    lat_ok = df["Latitude"].between(-35.0, -22.0).all()
-    check(
-        "Latitude within South Africa  (-35.0 to -22.0)",
-        lat_ok,
-        f"Actual range: {df['Latitude'].min():.4f}  to  {df['Latitude'].max():.4f}",
-    )
+    check("Longitude within SA  (16 to 33.5)",
+          df["Longitude"].between(16, 33.5).all(),
+          f"{df['Longitude'].min():.4f} to {df['Longitude'].max():.4f}")
 
-    lon_ok = df["Longitude"].between(16.0, 33.5).all()
-    check(
-        "Longitude within South Africa  (16.0 to 33.5)",
-        lon_ok,
-        f"Actual range: {df['Longitude'].min():.4f}  to  {df['Longitude'].max():.4f}",
-    )
+    check(f"Total Alkalinity within cap  (0 – {TA_CAP})",
+          df["Total Alkalinity"].between(0, TA_CAP, inclusive="right").all(),
+          f"Range: {df['Total Alkalinity'].min():.2f} to {df['Total Alkalinity'].max():.2f}")
 
-    # ── Electrical Conductance ────────────────────────────────────────────
-    ec = df["Electrical Conductance"]
-    check(
-        "EC values are positive",
-        (ec > 0).all(),
-        f"Min: {ec.min():.1f} µS/cm",
-    )
-    check(
-        "EC plausible upper bound  (< 50,000 µS/cm)",
-        (ec < 50_000).all(),
-        f"Max observed: {ec.max():.1f}  |  Training max: ~1,506 µS/cm",
-    )
+    check(f"Electrical Conductance within cap  (0 – {EC_CAP})",
+          df["Electrical Conductance"].between(0, EC_CAP, inclusive="right").all(),
+          f"Range: {df['Electrical Conductance'].min():.2f} to {df['Electrical Conductance'].max():.2f}")
 
-    # ── Total Alkalinity ──────────────────────────────────────────────────
-    ta = df["Total Alkalinity"]
-    check(
-        "Total Alkalinity values are positive",
-        (ta > 0).all(),
-        f"Range: {ta.min():.2f}  to  {ta.max():.2f} mg/L CaCO3",
-    )
+    check(f"DRP within cap  (0 – {DRP_CAP})",
+          df["Dissolved Reactive Phosphorus"].between(0, DRP_CAP, inclusive="both").all(),
+          f"Range: {df['Dissolved Reactive Phosphorus'].min():.2f} to {df['Dissolved Reactive Phosphorus'].max():.2f}")
 
-    # ── DRP ───────────────────────────────────────────────────────────────
-    drp = df["Dissolved Reactive Phosphorus"]
-    check(
-        "DRP values are non-negative",
-        (drp >= 0).all(),
-        f"Range: {drp.min():.2f}  to  {drp.max():.2f} µg/L",
-    )
+    pat = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    check("Date format DD-MM-YYYY",
+          df["Sample Date"].head(300).apply(
+              lambda x: bool(pat.match(str(x)))
+          ).all(),
+          f"Sample: {df['Sample Date'].head(3).tolist()}")
 
-    # ── Date format  DD-MM-YYYY ───────────────────────────────────────────
-    date_pattern = re.compile(r"^\d{2}-\d{2}-\d{4}$")
-    sample_check = df["Sample Date"].dropna().head(300)
-    dates_ok = sample_check.apply(lambda d: bool(date_pattern.match(str(d)))).all()
-    check(
-        "Sample Date format matches DD-MM-YYYY",
-        dates_ok,
-        f"Sample: {df['Sample Date'].head(3).tolist()}",
-    )
+    check("No duplicate Lat + Lon + Date",
+          df.duplicated(subset=["Latitude", "Longitude", "Sample Date"]).sum() == 0)
 
-    # ── No duplicate Lat + Lon + Date ─────────────────────────────────────
-    dupes = df.duplicated(subset=["Latitude", "Longitude", "Sample Date"]).sum()
-    check(
-        "No duplicate Lat + Lon + Date combinations",
-        dupes == 0,
-        f"Duplicates found: {dupes:,}",
-    )
-
-    # ── Distribution comparison vs EY training data ───────────────────────
+    # Distribution comparison vs EY training data
     print()
-    print("  Percentile distribution vs EY training data:")
-    print(f"  {'Variable':<35} {'NWU p25':>9} {'NWU p50':>9} {'NWU p75':>9}  "
+    print("  Percentile check vs EY training data:")
+    print(f"  {'Variable':<35} {'NWU p25':>9} {'NWU p50':>9} {'NWU p75':>9} "
           f"{'Train p25':>10} {'Train p50':>10} {'Train p75':>10}")
-    print(f"  {'─' * 96}")
+    print(f"  {'─'*96}")
 
-    # Reference training percentiles (computed from water_quality_training_dataset.csv)
-    ref_percentiles = {
-        "Total Alkalinity":               (33.3,   92.5,  182.6),
-        "Electrical Conductance":         (198.2,  381.6, 678.6),
-        "Dissolved Reactive Phosphorus":  (10.0,   20.0,   48.0),
+    ref = {
+        "Total Alkalinity":               (33.3,  92.5, 182.6),
+        "Electrical Conductance":         (198.2, 381.6, 678.6),
+        "Dissolved Reactive Phosphorus":  (10.0,  20.0,  48.0),
     }
-    for col, (tp25, tp50, tp75) in ref_percentiles.items():
+    for col, (tp25, tp50, tp75) in ref.items():
         p25 = df[col].quantile(0.25)
         p50 = df[col].quantile(0.50)
         p75 = df[col].quantile(0.75)
-        print(f"  {col:<35} {p25:>9.2f} {p50:>9.2f} {p75:>9.2f}  "
-              f"{tp25:>10.2f} {tp50:>10.2f} {tp75:>10.2f}")
+        print(f"  {col:<35} {p25:>9.1f} {p50:>9.1f} {p75:>9.1f} "
+              f"{tp25:>10.1f} {tp50:>10.1f} {tp75:>10.1f}")
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print(f"\n  {'─' * 44}")
-    print(f"  Results:  {passed} passed  |  {failed} failed")
+    print(f"\n  {'─'*44}")
+    print(f"  {passed} passed | {failed} failed")
     if failed == 0:
         print("  🎉 All checks passed — data is ready for modelling!")
     else:
-        print("  ⚠️  Some checks failed — review details above before proceeding.")
-    print("=" * 62 + "\n")
+        print("  ⚠️  Review failures above before proceeding.")
+    print("=" * 56)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    clean_df = run_pipeline()
-    sanity_check(clean_df)
+# ------------------------------------------------------------
+# RUN
+# ------------------------------------------------------------
+clean_df = run_pipeline()
+sanity_check(clean_df)
